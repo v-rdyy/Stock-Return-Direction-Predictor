@@ -6,10 +6,14 @@ from src.train_model import train_and_evaluate
 
 
 if __name__ == "__main__":
-    print("Starting...")
 
-    stock = str(input("Enter Stock: (E.g: AAPL) "))
-    period = str(input("Enter Timeframe: (E.g: 2y) "))
-    result = train_and_evaluate(stock, period)
+    stocks = ['AAPL', 'MSFT', 'AMZN']
 
-    print("Done!")
+    for stock in stocks:
+        print(f"\n{'='*50}")
+        print(f"Testing {stock}")
+        print(f"{'='*50}")
+        
+        result = train_and_evaluate(stock, "2y")
+        
+        print(f"\nCompleted {stock}\n")
