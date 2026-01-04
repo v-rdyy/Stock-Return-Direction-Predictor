@@ -14,6 +14,6 @@ if __name__ == "__main__":
         print(f"Testing {stock}")
         print(f"{'='*50}")
         
-        result = train_and_evaluate(stock, "2y")
-        
+        rf_model, lr_model = train_and_evaluate(stock, "2y")
+                
         print(f"\nCompleted {stock}\n")
