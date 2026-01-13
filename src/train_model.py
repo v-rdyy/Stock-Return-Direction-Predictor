@@ -70,7 +70,240 @@ def analyze_errors(y_test, y_pred, X_test):
         print(f"\nFalse Negative Patterns (avg feature values):")
         for feature, value in fn_features.items():
             print(f"  {feature:15}: {value:8.4f}")
+
+
+def backtest_strategy(returns, trade_signals, position_sizes=None):
+    """
+    Backtests a trading strategy.
     
+    Args:
+        returns: Actual returns (array or Series)
+        trade_signals: Boolean array (True = trade, False = no trade)
+        position_sizes: Position sizes (array, optional). If None, uses fixed size 1.0
+    
+    Returns:
+        dict with performance metrics (total_return, sharpe_ratio, max_drawdown, hit_rate, turnover)
+    """
+    # Convert to numpy arrays to avoid pandas deprecation warnings
+    returns = np.array(returns)
+    trade_signals = np.array(trade_signals)
+    
+    if position_sizes is None:
+        position_sizes = np.ones(len(trade_signals))
+        position_sizes[~trade_signals] = 0  # No position when no signal
+    else:
+        position_sizes = np.array(position_sizes)
+    
+    # Portfolio value over time (start with 1.0)
+    portfolio_value = np.ones(len(returns))
+    
+    # Calculate portfolio returns
+    # Portfolio return = position_size * actual_return
+    portfolio_returns = position_sizes * returns
+    
+    # Cumulative portfolio value
+    for i in range(1, len(portfolio_value)):
+        portfolio_value[i] = portfolio_value[i-1] * (1 + portfolio_returns[i-1])
+    
+    # Total return
+    total_return = portfolio_value[-1] - 1.0
+    
+    # Annualized Sharpe ratio (assuming 252 trading days per year)
+    # Sharpe = mean(returns) / std(returns) * sqrt(252)
+    if portfolio_returns.std() > 0:
+        sharpe_ratio = (portfolio_returns.mean() / portfolio_returns.std()) * np.sqrt(252)
+    else:
+        sharpe_ratio = 0.0
+    
+    # Max drawdown
+    # Drawdown = (peak - current) / peak
+    running_max = np.maximum.accumulate(portfolio_value)
+    drawdown = (running_max - portfolio_value) / running_max
+    max_drawdown = drawdown.max()
+    
+    # Hit rate (percentage of profitable trades)
+    trade_returns = portfolio_returns[trade_signals]
+    if len(trade_returns) > 0:
+        hit_rate = (trade_returns > 0).sum() / len(trade_returns)
+    else:
+        hit_rate = 0.0
+    
+    # Turnover (average absolute position size - measures trading activity)
+    turnover = np.abs(position_sizes).mean()
+    
+    return {
+        'total_return': total_return,
+        'sharpe_ratio': sharpe_ratio,
+        'max_drawdown': max_drawdown,
+        'hit_rate': hit_rate,
+        'turnover': turnover,
+        'portfolio_value': portfolio_value
+    }
+
+
+def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility, alpha=0.25, w_max=1.0, transaction_cost=0.001, allow_shorting=True):
+    """
+    Optimizes bias threshold and EV threshold to maximize Sharpe ratio.
+    Supports both long-only and long-short strategies.
+    
+    **CRITICAL CAVEAT - Overfitting Risk:**
+    Threshold optimization is performed on a fixed historical window and may overfit.
+    Results are used to study sensitivity and relative performance, not to claim deployable alpha.
+    For production use, optimize on one window and evaluate on a later, untouched window.
+    
+    Args:
+        y_proba_cal: Calibrated probabilities (array)
+        y_return_pred: Predicted returns (array)
+        y_return_actual: Actual returns (array)
+        volatility: Volatility values (array)
+        alpha: Kelly fraction (default 0.25)
+        w_max: Maximum position size (default 1.0)
+        transaction_cost: Transaction cost (default 0.001)
+        allow_shorting: If True, also test short positions (default True)
+    
+    Returns:
+        dict with best thresholds and performance metrics
+    """
+    # Convert to numpy arrays
+    y_proba_cal = np.array(y_proba_cal)
+    y_return_pred = np.array(y_return_pred)
+    y_return_actual = np.array(y_return_actual)
+    volatility = np.array(volatility)
+    
+    # Grid search: test different threshold combinations
+    long_bias_thresholds = [0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.65]
+    long_ev_thresholds = [0.0005, 0.001, 0.0015, 0.002, 0.0025, 0.003]  # EV threshold (transaction_cost + buffer)
+    
+    # For shorting: P(up) < threshold means short (e.g., P(up) < 0.45 means 55% chance of down)
+    # Mirror the long thresholds: short_bias = 1 - long_bias
+    if allow_shorting:
+        short_bias_thresholds = [0.35, 0.38, 0.40, 0.42, 0.45, 0.48, 0.50]  # P(up) < these values
+        short_ev_thresholds = [-0.003, -0.0025, -0.002, -0.0015, -0.001, -0.0005]  # Negative returns (stock goes down)
+    else:
+        short_bias_thresholds = []
+        short_ev_thresholds = []
+    
+    best_sharpe = -np.inf
+    best_config = None
+    
+    results = []
+    
+    # Test long positions
+    for bias_thresh in long_bias_thresholds:
+        for ev_thresh in long_ev_thresholds:
+            # Long filters: P(up) > threshold AND E[return] > threshold
+            long_bias_filter = y_proba_cal > bias_thresh
+            long_ev_filter = y_return_pred > ev_thresh
+            long_signal = long_bias_filter & long_ev_filter
+            
+            # Always test long-only strategy first (even if shorting is allowed)
+            if long_signal.sum() > 0:
+                # Calculate position sizes (long only)
+                position_size = np.zeros(len(long_signal))
+                position_size[long_signal] = alpha * y_return_pred[long_signal] / (volatility[long_signal] ** 2)
+                position_size = np.clip(position_size, 0, w_max)
+                
+                # Backtest long-only
+                results_dict = backtest_strategy(y_return_actual, long_signal, position_size)
+                
+                # Store results
+                config = {
+                    'long_bias_threshold': bias_thresh,
+                    'long_ev_threshold': ev_thresh,
+                    'short_bias_threshold': None,
+                    'short_ev_threshold': None,
+                    'n_trades': long_signal.sum(),
+                    'n_long': long_signal.sum(),
+                    'n_short': 0,
+                    'sharpe_ratio': results_dict['sharpe_ratio'],
+                    'total_return': results_dict['total_return'],
+                    'max_drawdown': results_dict['max_drawdown'],
+                    'hit_rate': results_dict['hit_rate']
+                }
+                results.append(config)
+                
+                # Track best (by Sharpe ratio)
+                if results_dict['sharpe_ratio'] > best_sharpe:
+                    best_sharpe = results_dict['sharpe_ratio']
+                    best_config = config
+            
+            # If shorting is allowed, also test long-short combinations
+            if allow_shorting:
+                for short_bias_thresh in short_bias_thresholds:
+                    for short_ev_thresh in short_ev_thresholds:
+                        # Short filters: P(up) < threshold AND E[return] < threshold (negative)
+                        short_bias_filter = y_proba_cal < short_bias_thresh
+                        short_ev_filter = y_return_pred < short_ev_thresh
+                        short_signal = short_bias_filter & short_ev_filter
+                        
+                        # Combined: long OR short (but not both on same day)
+                        trade_signal = long_signal | short_signal
+                        
+                        # Skip if no trades at all
+                        if trade_signal.sum() == 0:
+                            continue
+                        
+                        # Calculate position sizes
+                        position_size = np.zeros(len(trade_signal))
+                        
+                        # Long positions: positive size
+                        position_size[long_signal] = alpha * y_return_pred[long_signal] / (volatility[long_signal] ** 2)
+                        # Short positions: negative size (using absolute value of predicted return)
+                        position_size[short_signal] = -alpha * np.abs(y_return_pred[short_signal]) / (volatility[short_signal] ** 2)
+                        
+                        # Clip to [-w_max, w_max]
+                        position_size = np.clip(position_size, -w_max, w_max)
+                        
+                        # Backtest
+                        results_dict = backtest_strategy(y_return_actual, trade_signal, position_size)
+                        
+                        # Count long and short trades
+                        n_long = long_signal.sum()
+                        n_short = short_signal.sum()
+                        
+                        # Store results
+                        config = {
+                            'long_bias_threshold': bias_thresh,
+                            'long_ev_threshold': ev_thresh,
+                            'short_bias_threshold': short_bias_thresh,
+                            'short_ev_threshold': short_ev_thresh,
+                            'n_trades': trade_signal.sum(),
+                            'n_long': n_long,
+                            'n_short': n_short,
+                            'sharpe_ratio': results_dict['sharpe_ratio'],
+                            'total_return': results_dict['total_return'],
+                            'max_drawdown': results_dict['max_drawdown'],
+                            'hit_rate': results_dict['hit_rate']
+                        }
+                        results.append(config)
+                        
+                        # Track best (by Sharpe ratio)
+                        if results_dict['sharpe_ratio'] > best_sharpe:
+                            best_sharpe = results_dict['sharpe_ratio']
+                            best_config = config
+    
+    # Convert results to DataFrame for easier viewing
+    if len(results) > 0:
+        results_df = pd.DataFrame(results)
+        results_df = results_df.sort_values('sharpe_ratio', ascending=False)
+    else:
+        results_df = pd.DataFrame()
+        best_config = {
+            'long_bias_threshold': 0.55,
+            'long_ev_threshold': 0.0015,
+            'short_bias_threshold': None,
+            'short_ev_threshold': None,
+            'n_trades': 0,
+            'n_long': 0,
+            'n_short': 0,
+            'sharpe_ratio': 0.0,
+            'total_return': 0.0,
+            'max_drawdown': 0.0,
+            'hit_rate': 0.0
+        }
+    
+    return best_config, results_df
+
 
 def train_and_evaluate(stock, period):
 
@@ -288,5 +521,163 @@ def train_and_evaluate(stock, period):
         print(f"Mean realized return on high-confidence days: {mean_realized_return_high_conf:.4f}")
         print(f"Linear Regression MAE (high-confidence only): {lr_mae_high_conf:.6f}")
         print(f"Gradient Boosting MAE (high-confidence only): {gb_mae_high_conf:.6f}")
+
+    # Optimize thresholds (bias threshold and EV threshold)
+    # Tests different combinations to find best Sharpe ratio (including shorting)
+    # 
+    # CAVEAT: Threshold optimization may overfit to the test set. Results are used
+    # to study sensitivity and relative performance, not to claim deployable alpha.
+    transaction_cost = 0.001  # Fixed transaction cost (0.1%)
+    # NOTE: Results shown incorporate transaction costs as a return threshold buffer.
+    # A fixed cost can be incorporated as a return threshold buffer (done via EV threshold).
+    alpha = 0.25  # Kelly fraction (25% of full Kelly)
+    w_max = 1.0
+    volatility = X_test['volatility'].values
+    allow_shorting = True  # Enable shorting
+    
+    print("\n=== Optimizing Thresholds (Long-Short Strategy) ===")
+    print("NOTE: Threshold optimization may overfit; results used for sensitivity analysis.")
+    best_config, results_df = optimize_thresholds(
+        y_proba_rf_cal, y_return_pred_gb, y_return_test, volatility,
+        alpha=alpha, w_max=w_max, transaction_cost=transaction_cost,
+        allow_shorting=allow_shorting
+    )
+    
+    # Use optimized thresholds
+    long_bias_threshold = best_config['long_bias_threshold']
+    long_ev_threshold = best_config['long_ev_threshold']
+    short_bias_threshold = best_config.get('short_bias_threshold', None)
+    short_ev_threshold = best_config.get('short_ev_threshold', None)
+    
+    print(f"Best Configuration (by Sharpe Ratio):")
+    print(f"  Long Bias Threshold: {long_bias_threshold:.2f} (P(up) > {long_bias_threshold:.2f})")
+    print(f"  Long EV Threshold: {long_ev_threshold:.4f} (E[return] > {long_ev_threshold:.4f})")
+    if short_bias_threshold is not None:
+        print(f"  Short Bias Threshold: {short_bias_threshold:.2f} (P(up) < {short_bias_threshold:.2f})")
+        print(f"  Short EV Threshold: {short_ev_threshold:.4f} (E[return] < {short_ev_threshold:.4f})")
+    print(f"  Total Trades: {best_config['n_trades']} (Long: {best_config['n_long']}, Short: {best_config['n_short']})")
+    print(f"  Sharpe Ratio: {best_config['sharpe_ratio']:.2f}")
+    print(f"  Total Return: {best_config['total_return']:.2%}")
+    print(f"  Max Drawdown: {best_config['max_drawdown']:.2%}")
+    print(f"  Hit Rate: {best_config['hit_rate']:.2%}")
+    
+    if len(results_df) > 0:
+        print(f"\nTop 5 Configurations:")
+        top5 = results_df.head(5)[['long_bias_threshold', 'long_ev_threshold', 'short_bias_threshold', 'short_ev_threshold', 
+                                    'n_long', 'n_short', 'sharpe_ratio', 'total_return']]
+        print(top5.to_string(index=False))
+
+    # Use optimized thresholds for trading (long-short strategy)
+    # Long signals: P(up) > threshold AND E[return] > threshold
+    long_bias_filter = y_proba_rf_cal > long_bias_threshold
+    long_ev_filter = y_return_pred_gb > long_ev_threshold
+    long_signal = long_bias_filter & long_ev_filter
+    
+    # Short signals: P(up) < threshold AND E[return] < threshold (negative returns)
+    if short_bias_threshold is not None and short_ev_threshold is not None:
+        short_bias_filter = y_proba_rf_cal < short_bias_threshold
+        short_ev_filter = y_return_pred_gb < short_ev_threshold
+        short_signal = short_bias_filter & short_ev_filter
+    else:
+        short_signal = np.zeros(len(y_return_test), dtype=bool)
+    
+    # Combined trade signal: long OR short (but not both on same day)
+    trade_signal = long_signal | short_signal
+    
+    n_long = long_signal.sum()
+    n_short = short_signal.sum()
+    n_trades = trade_signal.sum()
+    trade_percentage = (n_trades / len(trade_signal)) * 100
+
+    # Calculate position sizes (positive for long, negative for short)
+    # CAVEAT: We use a capped, fractional Kelly-style heuristic for risk-aware sizing,
+    # not a true Kelly solution. This is a heuristic approximation, not optimal sizing.
+    position_size = np.zeros(len(trade_signal))
+    
+    # Long positions: positive size
+    # Kelly-style formula: w = α * E[return] / σ² (fractional Kelly with cap)
+    position_size[long_signal] = alpha * y_return_pred_gb[long_signal] / (volatility[long_signal] ** 2)
+    
+    # Short positions: negative size (using absolute value of predicted return)
+    if short_signal.sum() > 0:
+        position_size[short_signal] = -alpha * np.abs(y_return_pred_gb[short_signal]) / (volatility[short_signal] ** 2)
+    
+    # Clip to [-w_max, w_max] to allow short positions
+    position_size = np.clip(position_size, -w_max, w_max)
+    
+    # Backtest strategies (Phase 3, Step 3)
+    # Compare 5 strategies:
+    # 1. Buy and hold (always long)
+    # 2. Always trade long (when P(up) > 0.5)
+    # 3. Long filtered (when P(up) > threshold)
+    # 4. Long + EV filtered (both conditions with position sizing) - LONG ONLY
+    # 5. Long-Short optimized (both long and short with position sizing) - NEW WITH SHORTING
+    
+    # Strategy 1: Buy and hold (always long)
+    buy_hold_signals = np.ones(len(y_return_test), dtype=bool)
+    buy_hold_positions = np.ones(len(y_return_test))  # 100% position
+    buy_hold_results = backtest_strategy(y_return_test, buy_hold_signals, buy_hold_positions)
+    
+    # Strategy 2: Always trade long (when P(up) > 0.5)
+    always_long_signals = y_proba_rf_cal > 0.5
+    always_long_positions = np.ones(len(y_return_test))
+    always_long_positions[~always_long_signals] = 0  # No position when P(up) <= 0.5
+    always_long_results = backtest_strategy(y_return_test, always_long_signals, always_long_positions)
+    
+    # Strategy 3: Long filtered (when P(up) > threshold, no EV filter)
+    long_only_signals = long_bias_filter
+    long_only_positions = np.ones(len(y_return_test))
+    long_only_positions[~long_only_signals] = 0  # No position when filtered out
+    long_only_results = backtest_strategy(y_return_test, long_only_signals, long_only_positions)
+    
+    # Strategy 4: Long + EV filtered (both conditions with position sizing) - LONG ONLY
+    long_ev_positions = np.zeros(len(trade_signal))
+    long_ev_positions[long_signal] = alpha * y_return_pred_gb[long_signal] / (volatility[long_signal] ** 2)
+    long_ev_positions = np.clip(long_ev_positions, 0, w_max)  # No shorting
+    long_ev_results = backtest_strategy(y_return_test, long_signal, long_ev_positions)
+    
+    # Strategy 5: Long-Short optimized (both long and short with position sizing)
+    long_short_results = backtest_strategy(y_return_test, trade_signal, position_size)
+    
+    # Print strategy comparison results
+    print("\n=== Strategy Comparison (Backtesting Results) ===")
+    print("\n1. Buy and Hold (always long):")
+    print(f"   Total Return: {buy_hold_results['total_return']:.2%}")
+    print(f"   Sharpe Ratio: {buy_hold_results['sharpe_ratio']:.2f}")
+    print(f"   Max Drawdown: {buy_hold_results['max_drawdown']:.2%}")
+    print(f"   Hit Rate: {buy_hold_results['hit_rate']:.2%}")
+    print(f"   Turnover: {buy_hold_results['turnover']:.2f}")
+    
+    print("\n2. Always Trade Long (P(up) > 0.5):")
+    print(f"   Total Return: {always_long_results['total_return']:.2%}")
+    print(f"   Sharpe Ratio: {always_long_results['sharpe_ratio']:.2f}")
+    print(f"   Max Drawdown: {always_long_results['max_drawdown']:.2%}")
+    print(f"   Hit Rate: {always_long_results['hit_rate']:.2%}")
+    print(f"   Turnover: {always_long_results['turnover']:.2f}")
+    
+    print("\n3. Long Filtered (P(up) > {:.2f}, no EV filter):".format(long_bias_threshold))
+    print(f"   Total Return: {long_only_results['total_return']:.2%}")
+    print(f"   Sharpe Ratio: {long_only_results['sharpe_ratio']:.2f}")
+    print(f"   Max Drawdown: {long_only_results['max_drawdown']:.2%}")
+    print(f"   Hit Rate: {long_only_results['hit_rate']:.2%}")
+    print(f"   Turnover: {long_only_results['turnover']:.2f}")
+    
+    print("\n4. Long + EV Filtered (long only, with position sizing):")
+    print(f"   Total Return: {long_ev_results['total_return']:.2%}")
+    print(f"   Sharpe Ratio: {long_ev_results['sharpe_ratio']:.2f}")
+    print(f"   Max Drawdown: {long_ev_results['max_drawdown']:.2%}")
+    print(f"   Hit Rate: {long_ev_results['hit_rate']:.2%}")
+    print(f"   Turnover: {long_ev_results['turnover']:.2f}")
+    print(f"   Number of Long Trades: {n_long} ({n_long/len(trade_signal)*100:.1f}% of days)")
+    
+    print("\n5. Long-Short Optimized (both long and short with position sizing):")
+    print(f"   Total Return: {long_short_results['total_return']:.2%}")
+    print(f"   Sharpe Ratio: {long_short_results['sharpe_ratio']:.2f}")
+    print(f"   Max Drawdown: {long_short_results['max_drawdown']:.2%}")
+    print(f"   Hit Rate: {long_short_results['hit_rate']:.2%}")
+    print(f"   Turnover: {long_short_results['turnover']:.2f}")
+    print(f"   Total Trades: {n_trades} ({trade_percentage:.1f}% of days)")
+    print(f"   Long Trades: {n_long} ({n_long/len(trade_signal)*100:.1f}% of days)")
+    print(f"   Short Trades: {n_short} ({n_short/len(trade_signal)*100:.1f}% of days)")
 
     return model, lr_model, return_model_lr, return_model_gb        

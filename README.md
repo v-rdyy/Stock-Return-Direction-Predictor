@@ -165,6 +165,51 @@ Stock markets are:
 
 This system focuses on **probabilistic bias estimation** - knowing when there's edge, not trying to predict exact outcomes.
 
+## Critical Caveats and Limitations
+
+### A. Threshold Optimization and Overfitting Risk
+
+**Threshold optimization is performed on a fixed historical window and may overfit.**
+
+- Results are used to study sensitivity and relative performance, not to claim deployable alpha.
+- The grid search finds thresholds that maximize Sharpe ratio on the test set, which may not generalize to future data.
+- **For production use:** Optimize on one window and evaluate on a later, untouched window (walk-forward validation).
+
+**What this means:** The optimized thresholds shown are best-case results for the specific historical period tested. Real-world performance may differ.
+
+### B. Position Sizing: Kelly-Style Heuristic
+
+**We use a capped, fractional Kelly-style heuristic for risk-aware sizing, not a true Kelly solution.**
+
+- The formula `w = α * E[return] / σ²` is a simplified approximation.
+- True Kelly criterion requires assumptions (known edge, independent bets) that don't hold in practice.
+- We use `α = 0.25` (25% of full Kelly) as a conservative risk parameter.
+- Position sizes are capped at `w_max = 1.0` (100% of capital).
+
+**What this means:** Position sizing is a risk-aware heuristic, not an optimal solution. It provides reasonable risk management but is not theoretically optimal.
+
+### C. Transaction Costs
+
+**Results incorporate transaction costs as a return threshold buffer.**
+
+- A fixed transaction cost (0.1%) is incorporated via the EV threshold (expected return must exceed cost + buffer).
+- This is a simplified model; real trading has:
+  - Bid-ask spreads (variable by stock and volatility)
+  - Market impact (larger positions move prices)
+  - Slippage (execution price vs expected price)
+  - Brokerage fees (varies by broker)
+
+**What this means:** Backtested returns are more optimistic than real-world results. Actual trading would have higher costs, especially for larger positions or volatile stocks.
+
+### Summary
+
+These caveats are important for:
+- **Credibility**: Acknowledging limitations shows domain understanding
+- **Realistic expectations**: Results are illustrative, not guarantees
+- **Interview readiness**: Quant interviewers will ask about these limitations
+
+The system is designed for **educational and research purposes** to demonstrate probabilistic bias estimation, calibration, and backtesting methodology.
+
 ### Project Framing
 
 **This is a probabilistic bias estimation system, not a trading system.**
