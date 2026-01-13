@@ -1,8 +1,8 @@
 from sklearn.model_selection import train_test_split
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, brier_score_loss
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingRegressor
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix, brier_score_loss, mean_squared_error, mean_absolute_error, r2_score
 from sklearn.preprocessing import StandardScaler
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.calibration import CalibratedClassifierCV
 
 import numpy as np
@@ -85,10 +85,13 @@ def train_and_evaluate(stock, period):
 
     features = ['returns', 'ma5', 'ma20', 'volatility', 'momentum', 'rsi', 'price_to_ma', 'volume_ratio']
     X = df[features]
-    y = df['label']
+    y = df['label']  # Binary labels for probability models (Phase 1)
+    y_return = df['return_target']  # Return values for return models (Phase 2)
 
     # 80/20 split, no shuffling (time-series data)
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
+    # Split return target with the same split (same indices since shuffle=False)
+    _, _, y_return_train, y_return_test = train_test_split(X, y_return, test_size=0.2, shuffle=False)
 
     # Scale features (fit on train, transform both)
     scaler = StandardScaler()
@@ -136,6 +139,26 @@ def train_and_evaluate(stock, period):
     calibrated_lr = CalibratedClassifierCV(lr_model, method='isotonic', cv=5)
     calibrated_lr.fit(X_train_scaled, y_train)
     y_proba_lr_cal = calibrated_lr.predict_proba(X_test_scaled)[:, 1]
+
+    # Train return models (regression) - Phase 2
+    # Linear Regression baseline
+    return_model_lr = LinearRegression()
+    return_model_lr.fit(X_train_scaled, y_return_train)
+    y_return_pred_lr = return_model_lr.predict(X_test_scaled)
+
+    # Gradient Boosting Regressor (non-linear)
+    return_model_gb = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    return_model_gb.fit(X_train_scaled, y_return_train)
+    y_return_pred_gb = return_model_gb.predict(X_test_scaled)
+
+    # Calculate regression metrics (MSE, MAE, R²) for return models
+    lr_mse = mean_squared_error(y_return_test, y_return_pred_lr)
+    lr_mae = mean_absolute_error(y_return_test, y_return_pred_lr)
+    lr_r2 = r2_score(y_return_test, y_return_pred_lr)
+
+    gb_mse = mean_squared_error(y_return_test, y_return_pred_gb)
+    gb_mae = mean_absolute_error(y_return_test, y_return_pred_gb)
+    gb_r2 = r2_score(y_return_test, y_return_pred_gb)
 
     # Calculate Brier scores (calibration quality metric)
     # Lower Brier score = better calibration (0 = perfect, 1 = worst)
@@ -236,5 +259,34 @@ def train_and_evaluate(stock, period):
     print(f"Uncertainty range: [{uncertainty.min():.4f}, {uncertainty.max():.4f}]")
     print(f"Mean uncertainty (std): {uncertainty_std.mean():.4f}")
     print(f"Uncertainty std range: [{uncertainty_std.min():.4f}, {uncertainty_std.max():.4f}]")
+    
+    # Print expected return model results (Phase 2)
+    print("\n=== Expected Return Model Results (Phase 2) ===")
+    print("\nLinear Regression:")
+    print(f"  MSE: {lr_mse:.6f}")
+    print(f"  MAE: {lr_mae:.6f}")
+    print(f"  R²:  {lr_r2:.4f}")
+    
+    print("\nGradient Boosting:")
+    print(f"  MSE: {gb_mse:.6f}")
+    print(f"  MAE: {gb_mae:.6f}")
+    print(f"  R²:  {gb_r2:.4f}")
+    
+    # Conditional analysis: Performance on high-confidence days from Phase 1
+    # This shows how Phase 2 (return models) performs conditioned on Phase 1 (bias model) confidence
+    # High confidence threshold: P(up) > 0.6 (strong bias signal)
+    high_conf_mask = y_proba_rf_cal > 0.6
+    if high_conf_mask.sum() > 0:
+        high_conf_count = high_conf_mask.sum()
+        mean_realized_return_high_conf = y_return_test[high_conf_mask].mean()
+        # MAE on high-confidence days only
+        gb_mae_high_conf = mean_absolute_error(y_return_test[high_conf_mask], y_return_pred_gb[high_conf_mask])
+        lr_mae_high_conf = mean_absolute_error(y_return_test[high_conf_mask], y_return_pred_lr[high_conf_mask])
+        
+        print("\n=== Conditional Analysis (High-Confidence Days: P(up) > 0.6) ===")
+        print(f"High-confidence days: {high_conf_count} ({high_conf_count/len(y_test)*100:.1f}% of test set)")
+        print(f"Mean realized return on high-confidence days: {mean_realized_return_high_conf:.4f}")
+        print(f"Linear Regression MAE (high-confidence only): {lr_mae_high_conf:.6f}")
+        print(f"Gradient Boosting MAE (high-confidence only): {gb_mae_high_conf:.6f}")
 
-    return model, lr_model        
+    return model, lr_model, return_model_lr, return_model_gb        

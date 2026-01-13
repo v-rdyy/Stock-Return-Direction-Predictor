@@ -148,6 +148,14 @@ firsttrading/
 - Coverage: Typically 30-50% of days flagged (model is selective)
 - Uncertainty: Low variance means models agree (higher confidence)
 
+### Expected Return Model Performance (Phase 2)
+
+**Important:** For financial return prediction, low or even negative R² values are expected due to high noise. Model usefulness is judged downstream via selective trading performance, not raw regression scores.
+
+- **R² values** are often near 0 or negative (this is expected and normal)
+- **MSE/MAE** are meaningful for comparison between models, but absolute values may appear high
+- **Model evaluation** should focus on conditional performance (e.g., performance on high-confidence days) rather than global metrics
+
 ### Why Results Are Modest
 
 Stock markets are:
