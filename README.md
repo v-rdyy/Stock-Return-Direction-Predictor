@@ -1,17 +1,17 @@
-# Stock Return Direction Predictor
+# Probabilistic Stock Market Bias Estimator
 
-A machine learning project that predicts whether a stock's next-day return will be positive or negative using historical price data. This is a **binary classification problem** focusing on proper ML practices, evaluation, and analysis - not a trading system.
+A quantitative machine learning system that estimates daily directional market bias with calibrated confidence. This project focuses on **probabilistic bias estimation** rather than binary predictions, using calibration, uncertainty quantification, and proper evaluation metrics.
 
 ## Project Overview
 
-**Goal:** Predict if tomorrow's stock return will be positive (1) or negative (0) using only past information.
+**Goal:** Estimate the probability that tomorrow's stock return will be positive (P(up)) with calibrated confidence, not just predict up/down.
 
 **Key Points:**
-- Binary classification problem (up/down prediction)
+- Probabilistic output: Each day gets P(up) ∈ [0,1] (not just 0 or 1)
+- Calibrated probabilities: Probabilities are reliable (0.65 means ~65% historically)
+- Uncertainty quantification: Measures prediction confidence through ensemble variance
+- Calibration-focused evaluation: Win rate by bucket, coverage rate (not just accuracy)
 - Uses only historical data (no future information)
-- Proper train/test split with temporal ordering
-- Comprehensive evaluation with baselines and multiple metrics
-- Error analysis to understand model failures
 
 ## Features
 
@@ -33,19 +33,31 @@ Creates 8 features from raw price data:
 All features use only past data (no look-ahead bias).
 
 ### Models
-- **Random Forest Classifier**: Ensemble of 100 decision trees
-- **Logistic Regression**: Linear model for comparison and interpretability
+- **Random Forest Classifier**: Ensemble of 100 decision trees (probabilistic output)
+- **Logistic Regression**: Linear model for comparison (probabilistic output)
+
+### Probability Calibration
+- **Isotonic Regression**: Calibrates raw probabilities to reliable probabilities
+- Uses 5-fold cross-validation to fit calibrator
+- **Brier Score**: Evaluates calibration quality (lower is better)
+
+### Uncertainty Estimation
+- **Ensemble Method**: 5 Random Forest models with different random seeds
+- **Variance/Std**: Measures prediction variance across ensemble
+- Higher variance = more uncertainty (models disagree)
+- Lower variance = less uncertainty (models agree)
 
 ### Evaluation
-- **Metrics**: Accuracy, Precision, Recall, F1-score, Confusion Matrix
-- **Baselines**: 
-  - Always predict "up"
-  - Predict based on yesterday's return
-- **Feature Importance**: Analysis of which features matter most
-- **Error Analysis**: 
-  - False positives vs false negatives
-  - Performance by volatility (high vs low periods)
-  - Error pattern analysis
+- **Win Rate by Probability Bucket**: Groups predictions by probability ranges and calculates actual win rate
+  - Low (<0.45): Low probability predictions
+  - Neutral (0.45-0.55): No clear edge
+  - Weak (0.55-0.60): Weak edge
+  - Moderate (0.60-0.70): Moderate edge
+  - Strong (>0.70): Strong edge
+- **Coverage Rate**: Percent of days flagged as having edge (outside neutral zone)
+- **Calibration Metrics**: Brier scores (raw vs calibrated)
+- **Uncertainty Metrics**: Variance and std across ensemble
+- **Basic Accuracy**: For reference (simplified)
 
 ## Installation
 
@@ -77,9 +89,11 @@ python3 src/main.py
 This will:
 1. Download 2 years of data for AAPL, MSFT, and AMZN
 2. Create features and labels
-3. Train both models
-4. Evaluate performance
-5. Print comprehensive results including error analysis
+3. Train probability models (Random Forest, Logistic Regression)
+4. Calibrate probabilities
+5. Estimate uncertainty
+6. Evaluate with calibration-focused metrics
+7. Print comprehensive results
 
 ### Custom Usage
 
@@ -94,7 +108,7 @@ To test a single stock programmatically:
 ```python
 from src.train_model import train_and_evaluate
 
-model, lr_model = train_and_evaluate("AAPL", "2y")
+prob_model_rf, prob_model_lr = train_and_evaluate("AAPL", "2y")
 ```
 
 ## Project Structure
@@ -104,7 +118,7 @@ firsttrading/
 ├── src/
 │   ├── data_loader.py          # Downloads stock data from Yahoo Finance
 │   ├── feature_engineering.py  # Creates features and labels
-│   ├── train_model.py          # Trains models and evaluates performance
+│   ├── train_model.py          # Trains models, calibrates probabilities, estimates uncertainty
 │   └── main.py                 # Entry point - runs pipeline on multiple stocks
 ├── data/                       # Directory for data files (empty - data downloaded on-demand)
 ├── requirements.txt            # Python dependencies
@@ -113,27 +127,45 @@ firsttrading/
 
 ## Results and Limitations
 
+### What This System Does
+
+- Estimates P(up) for each day (probabilistic bias)
+- Provides calibrated probabilities (reliable confidence levels)
+- Quantifies uncertainty (knows when predictions are uncertain)
+- Filters out days without edge (neutral zone 0.45-0.55)
+
+### What This System Does NOT Do
+
+- Does not predict exact returns (only direction probability)
+- Does not size positions
+- Does not force trades
+- Does not optimize profit
+
 ### Typical Performance
-- Model accuracy: ~50-55% (slightly better than random 50%)
-- Baseline accuracy: ~51-56% (simple rules often perform similarly)
-- This is **expected and realistic** - stock direction prediction is inherently difficult
+
+- Calibration: Brier scores typically improve after calibration (especially for Random Forest)
+- Win Rate by Bucket: Higher probability buckets should have higher win rates (monotonic behavior)
+- Coverage: Typically 30-50% of days flagged (model is selective)
+- Uncertainty: Low variance means models agree (higher confidence)
 
 ### Why Results Are Modest
+
 Stock markets are:
 - **Noisy**: Random events affect prices
 - **Efficient**: Information is quickly reflected in prices
 - **Complex**: Many factors influence returns
 
-Academic research shows similar challenges - beating simple baselines consistently is difficult.
+This system focuses on **probabilistic bias estimation** - knowing when there's edge, not trying to predict exact outcomes.
 
 ### Project Framing
-**This is a modeling and evaluation project, not a trading system.**
+
+**This is a probabilistic bias estimation system, not a trading system.**
 
 The value is in:
-- Demonstrating proper ML practices
-- Comprehensive evaluation methodology
-- Understanding model limitations
-- Building a complete, professional pipeline
+- Probabilistic output (P(up), not just up/down)
+- Calibrated probabilities (reliable confidence)
+- Uncertainty quantification (knows when uncertain)
+- Proper evaluation (calibration-focused, not just accuracy)
 
 ## Key Technical Details
 
@@ -142,15 +174,24 @@ The value is in:
 - Train/test split preserves temporal order (shuffle=False)
 - Labels are computed correctly (shifted forward properly)
 
+### Probability Calibration
+- Isotonic regression maps raw probabilities to calibrated probabilities
+- Uses cross-validation to fit calibrator
+- Brier score measures calibration quality
+
+### Uncertainty Estimation
+- Ensemble of 5 Random Forest models with different random seeds
+- Variance across ensemble measures prediction uncertainty
+- Lower variance = higher confidence
+
 ### Evaluation Strategy
 - Time-series appropriate split (80/20, no shuffling)
-- Multiple metrics (not just accuracy)
-- Baseline comparisons
-- Error analysis by market conditions
+- Calibration-focused metrics (win rate by bucket, coverage rate)
+- Basic accuracy for reference
 
 ### Models Used
-- **Random Forest**: Non-linear, can capture complex patterns
-- **Logistic Regression**: Linear, more interpretable (coefficients show feature impact)
+- **Random Forest**: Non-linear, ensemble method (probabilistic output)
+- **Logistic Regression**: Linear, interpretable (probabilistic output)
 
 ## Technologies Used
 
@@ -158,16 +199,17 @@ The value is in:
 - pandas: Data manipulation
 - numpy: Numerical operations
 - yfinance: Stock data download
-- scikit-learn: Machine learning (models, metrics, preprocessing)
+- scikit-learn: Machine learning (models, metrics, preprocessing, calibration)
 
 ## Future Improvements (Optional)
 
 Potential extensions:
+- Expected return models (Phase 2)
+- Position sizing based on probability and uncertainty
+- Trading decision logic (filter by bias and expected return)
+- Backtesting engine
+- Regime analysis (performance by market conditions)
 - Walk-forward validation (more realistic time-series evaluation)
-- Cross-sectional prediction (predict across multiple stocks simultaneously)
-- Additional features (technical indicators, market sentiment)
-- Model hyperparameter tuning
-- Visualization dashboard
 
 ## License
 
@@ -175,5 +217,4 @@ This is a personal project for learning and portfolio purposes.
 
 ## Acknowledgments
 
-This project follows best practices for machine learning evaluation and time-series data handling. Stock prediction is used as a domain example to demonstrate ML pipeline development and evaluation skills.
-
+This project demonstrates probabilistic bias estimation with calibration and uncertainty quantification. Stock prediction is used as a domain example to showcase quantitative ML techniques for bias estimation and proper evaluation methodology.

@@ -40,5 +40,6 @@ def create_labels(df):
     """
     df['next_return'] = df['returns'].shift(-1)  # Tomorrow's return
     df['label'] = (df['next_return'] > 0).astype(int)  # 1 if up, 0 if down
+    df['return_target'] = df['next_return']
     df = df.dropna()  # Drop last row (has no tomorrow)
     return df
