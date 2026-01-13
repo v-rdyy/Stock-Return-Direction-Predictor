@@ -11,13 +11,20 @@ ENV/
 
 # Data files (often large)
 data/*.csv
+
+# Generated plots
+plots/
+*.png
+*.jpg
+*.pdf
 data/*.parquet
 data/*.pkl
 !data/.gitkeep
 
 # Jupyter
 .ipynb_checkpoints
-*.ipynb
+# Keep notebooks in notebooks/ directory
+!notebooks/*.ipynb
 
 # IDE
 .vscode/

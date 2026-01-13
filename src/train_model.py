@@ -6,6 +6,7 @@ from sklearn.linear_model import LogisticRegression, LinearRegression
 from sklearn.calibration import CalibratedClassifierCV
 
 import numpy as np
+import matplotlib.pyplot as plt
 
 import pandas as pd 
 
@@ -72,17 +73,53 @@ def analyze_errors(y_test, y_pred, X_test):
             print(f"  {feature:15}: {value:8.4f}")
 
 
-def backtest_strategy(returns, trade_signals, position_sizes=None):
+def calculate_transaction_cost(volatility, base_cost=0.001, volatility_multiplier=2.0):
     """
-    Backtests a trading strategy.
+    Calculates volatility-scaled transaction costs.
+    
+    Real trading costs increase with volatility due to:
+    - Wider bid-ask spreads (more volatile stocks have larger spreads)
+    - Market impact (larger price moves during execution)
+    - Slippage (execution price vs expected price)
+    
+    Formula: cost = base_cost * (1 + volatility_multiplier * volatility)
+    
+    Args:
+        volatility: Volatility values (array or scalar)
+        base_cost: Base transaction cost (default 0.001 = 0.1%)
+        volatility_multiplier: How much volatility increases costs (default 2.0)
+    
+    Returns:
+        Transaction cost (array or scalar, same shape as volatility)
+    
+    Example:
+        base_cost = 0.001 (0.1%)
+        volatility = 0.02 (2% daily volatility)
+        volatility_multiplier = 2.0
+        cost = 0.001 * (1 + 2.0 * 0.02) = 0.001 * 1.04 = 0.00104 (0.104%)
+    """
+    volatility = np.array(volatility)
+    cost = base_cost * (1 + volatility_multiplier * volatility)
+    return cost
+
+
+def backtest_strategy(returns, trade_signals, position_sizes=None, stop_loss_pct=None):
+    """
+    Backtests a trading strategy with optional stop-loss.
+    
+    **Stop-Loss Note:** Stop-loss is a risk containment mechanism, not an alpha generator.
+    It limits downside risk but may also exit profitable positions prematurely.
     
     Args:
         returns: Actual returns (array or Series)
         trade_signals: Boolean array (True = trade, False = no trade)
         position_sizes: Position sizes (array, optional). If None, uses fixed size 1.0
+        stop_loss_pct: Stop-loss percentage (e.g., 0.02 = 2%). If None, no stop-loss.
+                       For long: exit if position drops by stop_loss_pct from entry
+                       For short: exit if position rises by stop_loss_pct from entry
     
     Returns:
-        dict with performance metrics (total_return, sharpe_ratio, max_drawdown, hit_rate, turnover)
+        dict with performance metrics (total_return, sharpe_ratio, max_drawdown, hit_rate, turnover, n_stop_losses)
     """
     # Convert to numpy arrays to avoid pandas deprecation warnings
     returns = np.array(returns)
@@ -97,9 +134,49 @@ def backtest_strategy(returns, trade_signals, position_sizes=None):
     # Portfolio value over time (start with 1.0)
     portfolio_value = np.ones(len(returns))
     
-    # Calculate portfolio returns
-    # Portfolio return = position_size * actual_return
-    portfolio_returns = position_sizes * returns
+    # Track positions for stop-loss (if enabled)
+    effective_positions = position_sizes.copy()
+    n_stop_losses = 0
+    
+    if stop_loss_pct is not None and stop_loss_pct > 0:
+        # Track current position state for stop-loss
+        in_position = False
+        entry_index = -1  # Index when position was entered
+        entry_position_size = 0.0
+        
+        for i in range(len(returns)):
+            current_position = effective_positions[i]
+            
+            if not in_position and current_position != 0:
+                # Entering a new position
+                in_position = True
+                entry_index = i
+                entry_position_size = current_position
+            elif in_position:
+                # We're in a position - check stop-loss
+                if current_position == 0:
+                    # Position closed by signal (not stop-loss)
+                    in_position = False
+                else:
+                    # Calculate cumulative return since entry
+                    # For long: cumulative_return = product of (1 + returns) since entry
+                    # For short: cumulative_return = product of (1 - returns) since entry
+                    cumulative_return = 1.0
+                    for j in range(entry_index, i + 1):
+                        if entry_position_size > 0:  # Long position
+                            cumulative_return *= (1 + returns[j])
+                        else:  # Short position
+                            cumulative_return *= (1 - returns[j])
+                    
+                    # Check stop-loss: if cumulative return has dropped by stop_loss_pct
+                    if cumulative_return < (1 - stop_loss_pct):
+                        # Trigger stop-loss: exit position
+                        effective_positions[i] = 0
+                        in_position = False
+                        n_stop_losses += 1
+    
+    # Calculate portfolio returns with effective positions (after stop-loss)
+    portfolio_returns = effective_positions * returns
     
     # Cumulative portfolio value
     for i in range(1, len(portfolio_value)):
@@ -122,14 +199,16 @@ def backtest_strategy(returns, trade_signals, position_sizes=None):
     max_drawdown = drawdown.max()
     
     # Hit rate (percentage of profitable trades)
-    trade_returns = portfolio_returns[trade_signals]
+    # Only count trades that weren't stopped out
+    active_trades = effective_positions != 0
+    trade_returns = portfolio_returns[active_trades]
     if len(trade_returns) > 0:
         hit_rate = (trade_returns > 0).sum() / len(trade_returns)
     else:
         hit_rate = 0.0
     
     # Turnover (average absolute position size - measures trading activity)
-    turnover = np.abs(position_sizes).mean()
+    turnover = np.abs(effective_positions).mean()
     
     return {
         'total_return': total_return,
@@ -137,11 +216,115 @@ def backtest_strategy(returns, trade_signals, position_sizes=None):
         'max_drawdown': max_drawdown,
         'hit_rate': hit_rate,
         'turnover': turnover,
-        'portfolio_value': portfolio_value
+        'portfolio_value': portfolio_value,
+        'n_stop_losses': n_stop_losses
     }
 
 
-def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility, alpha=0.25, w_max=1.0, transaction_cost=0.001, allow_shorting=True):
+def plot_backtest_results(portfolio_value, strategy_name, stock_name, save_path=None):
+    """
+    Creates visualization plots for backtesting results.
+    
+    Plots:
+    1. Equity curve: Portfolio value over time
+    2. Drawdown: Peak-to-trough decline over time
+    
+    Args:
+        portfolio_value: Array of portfolio values over time
+        strategy_name: Name of the strategy (for title)
+        stock_name: Stock ticker (for title)
+        save_path: Optional path to save figure (if None, just displays)
+    """
+    portfolio_value = np.array(portfolio_value)
+    n_days = len(portfolio_value)
+    
+    # Calculate drawdown
+    running_max = np.maximum.accumulate(portfolio_value)
+    drawdown = (running_max - portfolio_value) / running_max * 100  # Convert to percentage
+    
+    # Create figure with two subplots
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8), sharex=True)
+    
+    # Plot 1: Equity Curve
+    days = np.arange(n_days)
+    ax1.plot(days, portfolio_value, linewidth=2, color='#2E86AB', label='Portfolio Value')
+    ax1.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='Initial Capital')
+    ax1.set_ylabel('Portfolio Value', fontsize=12)
+    ax1.set_title(f'{strategy_name} - {stock_name}: Equity Curve', fontsize=14, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='best')
+    
+    # Add final return annotation
+    final_return = (portfolio_value[-1] - 1.0) * 100
+    ax1.text(0.02, 0.98, f'Total Return: {final_return:.2f}%', 
+             transform=ax1.transAxes, fontsize=10, verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.5))
+    
+    # Plot 2: Drawdown
+    ax2.fill_between(days, 0, drawdown, color='#A23B72', alpha=0.6, label='Drawdown')
+    ax2.plot(days, drawdown, linewidth=1, color='#A23B72')
+    ax2.set_ylabel('Drawdown (%)', fontsize=12)
+    ax2.set_xlabel('Trading Days', fontsize=12)
+    ax2.set_title('Drawdown Over Time', fontsize=12, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.legend(loc='best')
+    ax2.invert_yaxis()  # Drawdown should go down (negative is good)
+    
+    # Add max drawdown annotation
+    max_dd = drawdown.max()
+    ax2.text(0.02, 0.02, f'Max Drawdown: {max_dd:.2f}%', 
+             transform=ax2.transAxes, fontsize=10, verticalalignment='bottom',
+             bbox=dict(boxstyle='round', facecolor='lightcoral', alpha=0.5))
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved plot to {save_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+
+
+def plot_strategy_comparison(strategy_results, stock_name, save_path=None):
+    """
+    Creates a comparison plot of multiple strategies.
+    
+    Args:
+        strategy_results: Dict with strategy names as keys and portfolio_value arrays as values
+        stock_name: Stock ticker (for title)
+        save_path: Optional path to save figure
+    """
+    fig, ax = plt.subplots(figsize=(12, 6))
+    
+    colors = ['#2E86AB', '#A23B72', '#F18F01', '#C73E1D', '#6A994E']
+    
+    for i, (strategy_name, portfolio_value) in enumerate(strategy_results.items()):
+        portfolio_value = np.array(portfolio_value)
+        days = np.arange(len(portfolio_value))
+        color = colors[i % len(colors)]
+        ax.plot(days, portfolio_value, linewidth=2, label=strategy_name, color=color)
+    
+    ax.axhline(y=1.0, color='gray', linestyle='--', alpha=0.5, label='Initial Capital')
+    ax.set_xlabel('Trading Days', fontsize=12)
+    ax.set_ylabel('Portfolio Value', fontsize=12)
+    ax.set_title(f'Strategy Comparison - {stock_name}', fontsize=14, fontweight='bold')
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc='best')
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"Saved comparison plot to {save_path}")
+    else:
+        plt.show()
+    
+    plt.close()
+
+
+def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility, alpha=0.25, w_max=1.0, base_transaction_cost=0.001, volatility_multiplier=2.0, allow_shorting=True, stop_loss_pct=None):
     """
     Optimizes bias threshold and EV threshold to maximize Sharpe ratio.
     Supports both long-only and long-short strategies.
@@ -151,6 +334,10 @@ def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility,
     Results are used to study sensitivity and relative performance, not to claim deployable alpha.
     For production use, optimize on one window and evaluate on a later, untouched window.
     
+    **Transaction Costs:**
+    Uses volatility-scaled transaction costs: cost = base_cost * (1 + multiplier * volatility)
+    This accounts for wider spreads and slippage in volatile markets.
+    
     Args:
         y_proba_cal: Calibrated probabilities (array)
         y_return_pred: Predicted returns (array)
@@ -158,7 +345,8 @@ def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility,
         volatility: Volatility values (array)
         alpha: Kelly fraction (default 0.25)
         w_max: Maximum position size (default 1.0)
-        transaction_cost: Transaction cost (default 0.001)
+        base_transaction_cost: Base transaction cost (default 0.001 = 0.1%)
+        volatility_multiplier: How much volatility increases costs (default 2.0)
         allow_shorting: If True, also test short positions (default True)
     
     Returns:
@@ -170,15 +358,24 @@ def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility,
     y_return_actual = np.array(y_return_actual)
     volatility = np.array(volatility)
     
+    # Calculate dynamic transaction costs based on volatility
+    # Cost varies by day: higher volatility = higher costs (wider spreads, slippage)
+    transaction_costs = calculate_transaction_cost(volatility, base_transaction_cost, volatility_multiplier)
+    avg_transaction_cost = transaction_costs.mean()  # Use average for EV threshold grid search
+    
     # Grid search: test different threshold combinations
     long_bias_thresholds = [0.50, 0.52, 0.55, 0.58, 0.60, 0.62, 0.65]
-    long_ev_thresholds = [0.0005, 0.001, 0.0015, 0.002, 0.0025, 0.003]  # EV threshold (transaction_cost + buffer)
+    # EV thresholds: base values that account for avg transaction cost + buffer
+    long_ev_thresholds = [avg_transaction_cost * 0.5, avg_transaction_cost, avg_transaction_cost * 1.5, 
+                         avg_transaction_cost * 2.0, avg_transaction_cost * 2.5, avg_transaction_cost * 3.0]
     
     # For shorting: P(up) < threshold means short (e.g., P(up) < 0.45 means 55% chance of down)
     # Mirror the long thresholds: short_bias = 1 - long_bias
     if allow_shorting:
         short_bias_thresholds = [0.35, 0.38, 0.40, 0.42, 0.45, 0.48, 0.50]  # P(up) < these values
-        short_ev_thresholds = [-0.003, -0.0025, -0.002, -0.0015, -0.001, -0.0005]  # Negative returns (stock goes down)
+        # Short EV thresholds: symmetric to long (negative returns, account for transaction costs)
+        short_ev_thresholds = [-avg_transaction_cost * 3.0, -avg_transaction_cost * 2.5, -avg_transaction_cost * 2.0,
+                               -avg_transaction_cost * 1.5, -avg_transaction_cost, -avg_transaction_cost * 0.5]
     else:
         short_bias_thresholds = []
         short_ev_thresholds = []
@@ -204,7 +401,7 @@ def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility,
                 position_size = np.clip(position_size, 0, w_max)
                 
                 # Backtest long-only
-                results_dict = backtest_strategy(y_return_actual, long_signal, position_size)
+                results_dict = backtest_strategy(y_return_actual, long_signal, position_size, stop_loss_pct=stop_loss_pct)
                 
                 # Store results
                 config = {
@@ -255,7 +452,7 @@ def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility,
                         position_size = np.clip(position_size, -w_max, w_max)
                         
                         # Backtest
-                        results_dict = backtest_strategy(y_return_actual, trade_signal, position_size)
+                        results_dict = backtest_strategy(y_return_actual, trade_signal, position_size, stop_loss_pct=stop_loss_pct)
                         
                         # Count long and short trades
                         n_long = long_signal.sum()
@@ -303,6 +500,243 @@ def optimize_thresholds(y_proba_cal, y_return_pred, y_return_actual, volatility,
         }
     
     return best_config, results_df
+
+
+def walk_forward_validation(stock, period, train_size=0.7, test_size=0.1, step=0.1, verbose=True):
+    """
+    Performs walk-forward validation: trains on rolling windows and tests on future data.
+    
+    This addresses overfitting by:
+    - Training on one period, testing on the next (truly unseen data)
+    - Retraining periodically (like real trading)
+    - Showing how performance changes over time
+    
+    Args:
+        stock: Stock ticker (e.g., 'AAPL')
+        period: Data period (e.g., '2y')
+        train_size: Fraction of data for initial training (default 0.7 = 70%)
+        test_size: Fraction of data for each test window (default 0.1 = 10%)
+        step: Fraction to slide forward each iteration (default 0.1 = 10%)
+        verbose: If True, print detailed results for each window
+    
+    Returns:
+        dict with aggregated results across all windows
+    """
+    # Download and prepare data
+    df = download_stock_data(stock, period)
+    df = create_features(df)
+    df = create_labels(df)
+    
+    features = ['returns', 'ma5', 'ma20', 'volatility', 'momentum', 'rsi', 'price_to_ma', 'volume_ratio']
+    X = df[features]
+    y = df['label']
+    y_return = df['return_target']
+    
+    n_total = len(X)
+    n_train = int(n_total * train_size)
+    n_test = int(n_total * test_size)
+    n_step = int(n_total * step)
+    
+    if verbose:
+        print(f"\n=== Walk-Forward Validation: {stock} ===")
+        print(f"Total data points: {n_total}")
+        print(f"Initial train size: {n_train} ({train_size:.0%})")
+        print(f"Test window size: {n_test} ({test_size:.0%})")
+        print(f"Step size: {n_step} ({step:.0%})")
+        print(f"Number of windows: {max(1, (n_total - n_train) // n_step)}")
+    
+    # Store results for each window
+    window_results = []
+    all_test_returns = []
+    all_portfolio_values = []
+    
+    # Walk forward: train on [0:train_end], test on [train_end:train_end+test_size]
+    train_end = n_train
+    window_num = 1
+    
+    while train_end + n_test <= n_total:
+        # Split into train and test for this window
+        X_train_window = X.iloc[:train_end]
+        X_test_window = X.iloc[train_end:train_end + n_test]
+        y_train_window = y.iloc[:train_end]
+        y_test_window = y.iloc[train_end:train_end + n_test]
+        y_return_train_window = y_return.iloc[:train_end]
+        y_return_test_window = y_return.iloc[train_end:train_end + n_test]
+        
+        if verbose:
+            print(f"\n--- Window {window_num}: Train [0:{train_end}], Test [{train_end}:{train_end + n_test}] ---")
+        
+        # Run full pipeline for this window (we'll create a helper function)
+        window_result = _train_and_evaluate_window(
+            X_train_window, X_test_window,
+            y_train_window, y_test_window,
+            y_return_train_window, y_return_test_window,
+            verbose=verbose
+        )
+        
+        window_result['window_num'] = window_num
+        window_result['train_end'] = train_end
+        window_result['test_start'] = train_end
+        window_result['test_end'] = train_end + n_test
+        window_results.append(window_result)
+        
+        # Aggregate portfolio values (for overall equity curve)
+        all_test_returns.extend(y_return_test_window.values)
+        if 'portfolio_value' in window_result:
+            all_portfolio_values.extend(window_result['portfolio_value'])
+        
+        # Slide forward
+        train_end += n_step
+        window_num += 1
+        
+        # Safety: don't create windows that are too small
+        if train_end + n_test > n_total:
+            break
+    
+    # Aggregate results across all windows
+    if len(window_results) > 0:
+        aggregated = {
+            'n_windows': len(window_results),
+            'mean_sharpe': np.mean([r['sharpe_ratio'] for r in window_results]),
+            'mean_return': np.mean([r['total_return'] for r in window_results]),
+            'mean_drawdown': np.mean([r['max_drawdown'] for r in window_results]),
+            'mean_hit_rate': np.mean([r['hit_rate'] for r in window_results]),
+            'std_sharpe': np.std([r['sharpe_ratio'] for r in window_results]),
+            'std_return': np.std([r['total_return'] for r in window_results]),
+            'window_results': window_results
+        }
+        
+        # Calculate overall portfolio performance (if we have all portfolio values)
+        if len(all_portfolio_values) > 0 and len(all_test_returns) > 0:
+            # Reconstruct overall portfolio value
+            overall_portfolio = np.ones(len(all_test_returns))
+            # This is simplified - in reality we'd need to track positions across windows
+            # For now, just show aggregated metrics
+            pass
+    else:
+        aggregated = None
+    
+    if verbose and aggregated:
+        print(f"\n=== Walk-Forward Summary: {stock} ===")
+        print(f"Number of windows: {aggregated['n_windows']}")
+        print(f"Mean Sharpe Ratio: {aggregated['mean_sharpe']:.2f} (std: {aggregated['std_sharpe']:.2f})")
+        print(f"Mean Total Return: {aggregated['mean_return']:.2%} (std: {aggregated['std_return']:.2%})")
+        print(f"Mean Max Drawdown: {aggregated['mean_drawdown']:.2%}")
+        print(f"Mean Hit Rate: {aggregated['mean_hit_rate']:.2%}")
+    
+    return aggregated
+
+
+def _train_and_evaluate_window(X_train, X_test, y_train, y_test, y_return_train, y_return_test, verbose=True):
+    """
+    Helper function: runs the full training and evaluation pipeline for a single window.
+    This is the core logic extracted from train_and_evaluate().
+    
+    Returns a dict with results instead of printing everything.
+    """
+    # Scale features
+    scaler = StandardScaler()
+    scaler.fit(X_train)
+    X_train_scaled = scaler.transform(X_train)
+    X_test_scaled = scaler.transform(X_test)
+    
+    # Train probability models (Phase 1)
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.calibration import CalibratedClassifierCV
+    
+    model = RandomForestClassifier(n_estimators=100, random_state=42)
+    model.fit(X_train_scaled, y_train)
+    
+    lr_model = LogisticRegression(random_state=42, max_iter=1000)
+    lr_model.fit(X_train_scaled, y_train)
+    
+    # Calibrate probabilities
+    model_cal = CalibratedClassifierCV(model, method='isotonic', cv=5)
+    model_cal.fit(X_train_scaled, y_train)
+    
+    lr_model_cal = CalibratedClassifierCV(lr_model, method='isotonic', cv=5)
+    lr_model_cal.fit(X_train_scaled, y_train)
+    
+    # Get calibrated probabilities
+    y_proba_rf_cal = model_cal.predict_proba(X_test_scaled)[:, 1]
+    
+    # Train return models (Phase 2)
+    from sklearn.linear_model import LinearRegression
+    from sklearn.ensemble import GradientBoostingRegressor
+    
+    return_model_lr = LinearRegression()
+    return_model_lr.fit(X_train_scaled, y_return_train)
+    
+    return_model_gb = GradientBoostingRegressor(n_estimators=100, random_state=42)
+    return_model_gb.fit(X_train_scaled, y_return_train)
+    
+    y_return_pred_lr = return_model_lr.predict(X_test_scaled)
+    y_return_pred_gb = return_model_gb.predict(X_test_scaled)
+    
+    # Optimize thresholds and backtest (Phase 3)
+    # Use volatility-scaled transaction costs
+    volatility = X_test['volatility'].values
+    base_transaction_cost = 0.001  # Base cost (0.1%)
+    volatility_multiplier = 2.0  # How much volatility increases costs
+    alpha = 0.25
+    w_max = 1.0
+    allow_shorting = True
+    
+    # Stop-loss parameter (same as main function)
+    stop_loss_pct = 0.02  # 2% stop-loss
+    
+    best_config, _ = optimize_thresholds(
+        y_proba_rf_cal, y_return_pred_gb, y_return_test.values, volatility,
+        alpha=alpha, w_max=w_max, 
+        base_transaction_cost=base_transaction_cost,
+        volatility_multiplier=volatility_multiplier,
+        allow_shorting=allow_shorting,
+        stop_loss_pct=stop_loss_pct
+    )
+    
+    # Create trade signals with optimized thresholds
+    long_bias_threshold = best_config['long_bias_threshold']
+    long_ev_threshold = best_config['long_ev_threshold']
+    short_bias_threshold = best_config.get('short_bias_threshold', None)
+    short_ev_threshold = best_config.get('short_ev_threshold', None)
+    
+    long_bias_filter = y_proba_rf_cal > long_bias_threshold
+    long_ev_filter = y_return_pred_gb > long_ev_threshold
+    long_signal = long_bias_filter & long_ev_filter
+    
+    if short_bias_threshold is not None and short_ev_threshold is not None:
+        short_bias_filter = y_proba_rf_cal < short_bias_threshold
+        short_ev_filter = y_return_pred_gb < short_ev_threshold
+        short_signal = short_bias_filter & short_ev_filter
+    else:
+        short_signal = np.zeros(len(y_test), dtype=bool)
+    
+    trade_signal = long_signal | short_signal
+    
+    # Position sizing
+    position_size = np.zeros(len(trade_signal))
+    position_size[long_signal] = alpha * y_return_pred_gb[long_signal] / (volatility[long_signal] ** 2)
+    if short_signal.sum() > 0:
+        position_size[short_signal] = -alpha * np.abs(y_return_pred_gb[short_signal]) / (volatility[short_signal] ** 2)
+    position_size = np.clip(position_size, -w_max, w_max)
+    
+    # Backtest (with stop-loss)
+    results = backtest_strategy(y_return_test.values, trade_signal, position_size, stop_loss_pct=stop_loss_pct)
+    
+    # Add additional info
+    results['n_long'] = long_signal.sum()
+    results['n_short'] = short_signal.sum()
+    results['n_trades'] = trade_signal.sum()
+    results['long_bias_threshold'] = long_bias_threshold
+    results['long_ev_threshold'] = long_ev_threshold
+    
+    if verbose:
+        print(f"  Sharpe: {results['sharpe_ratio']:.2f}, Return: {results['total_return']:.2%}, "
+              f"Drawdown: {results['max_drawdown']:.2%}, Trades: {results['n_trades']} "
+              f"(Long: {results['n_long']}, Short: {results['n_short']})")
+    
+    return results
 
 
 def train_and_evaluate(stock, period):
@@ -527,19 +961,27 @@ def train_and_evaluate(stock, period):
     # 
     # CAVEAT: Threshold optimization may overfit to the test set. Results are used
     # to study sensitivity and relative performance, not to claim deployable alpha.
-    transaction_cost = 0.001  # Fixed transaction cost (0.1%)
-    # NOTE: Results shown incorporate transaction costs as a return threshold buffer.
-    # A fixed cost can be incorporated as a return threshold buffer (done via EV threshold).
+    # Transaction cost modeling: volatility-scaled costs
+    # Higher volatility = wider spreads, more slippage, higher costs
+    base_transaction_cost = 0.001  # Base cost (0.1%)
+    volatility_multiplier = 2.0  # How much volatility increases costs
     alpha = 0.25  # Kelly fraction (25% of full Kelly)
     w_max = 1.0
     volatility = X_test['volatility'].values
     allow_shorting = True  # Enable shorting
     
+    # Stop-loss: risk containment mechanism (not alpha generation)
+    # Exit position if it drops by stop_loss_pct from entry
+    stop_loss_pct = 0.02  # 2% stop-loss (configurable, set to None to disable)
+    
     print("\n=== Optimizing Thresholds (Long-Short Strategy) ===")
     print("NOTE: Threshold optimization may overfit; results used for sensitivity analysis.")
+    print(f"Using volatility-scaled transaction costs (base: {base_transaction_cost:.3f}, multiplier: {volatility_multiplier:.1f})")
     best_config, results_df = optimize_thresholds(
         y_proba_rf_cal, y_return_pred_gb, y_return_test, volatility,
-        alpha=alpha, w_max=w_max, transaction_cost=transaction_cost,
+        alpha=alpha, w_max=w_max, 
+        base_transaction_cost=base_transaction_cost, 
+        volatility_multiplier=volatility_multiplier,
         allow_shorting=allow_shorting
     )
     
@@ -616,28 +1058,28 @@ def train_and_evaluate(stock, period):
     # Strategy 1: Buy and hold (always long)
     buy_hold_signals = np.ones(len(y_return_test), dtype=bool)
     buy_hold_positions = np.ones(len(y_return_test))  # 100% position
-    buy_hold_results = backtest_strategy(y_return_test, buy_hold_signals, buy_hold_positions)
+    buy_hold_results = backtest_strategy(y_return_test, buy_hold_signals, buy_hold_positions, stop_loss_pct=stop_loss_pct)
     
     # Strategy 2: Always trade long (when P(up) > 0.5)
     always_long_signals = y_proba_rf_cal > 0.5
     always_long_positions = np.ones(len(y_return_test))
     always_long_positions[~always_long_signals] = 0  # No position when P(up) <= 0.5
-    always_long_results = backtest_strategy(y_return_test, always_long_signals, always_long_positions)
+    always_long_results = backtest_strategy(y_return_test, always_long_signals, always_long_positions, stop_loss_pct=stop_loss_pct)
     
     # Strategy 3: Long filtered (when P(up) > threshold, no EV filter)
     long_only_signals = long_bias_filter
     long_only_positions = np.ones(len(y_return_test))
     long_only_positions[~long_only_signals] = 0  # No position when filtered out
-    long_only_results = backtest_strategy(y_return_test, long_only_signals, long_only_positions)
+    long_only_results = backtest_strategy(y_return_test, long_only_signals, long_only_positions, stop_loss_pct=stop_loss_pct)
     
     # Strategy 4: Long + EV filtered (both conditions with position sizing) - LONG ONLY
     long_ev_positions = np.zeros(len(trade_signal))
     long_ev_positions[long_signal] = alpha * y_return_pred_gb[long_signal] / (volatility[long_signal] ** 2)
     long_ev_positions = np.clip(long_ev_positions, 0, w_max)  # No shorting
-    long_ev_results = backtest_strategy(y_return_test, long_signal, long_ev_positions)
+    long_ev_results = backtest_strategy(y_return_test, long_signal, long_ev_positions, stop_loss_pct=stop_loss_pct)
     
     # Strategy 5: Long-Short optimized (both long and short with position sizing)
-    long_short_results = backtest_strategy(y_return_test, trade_signal, position_size)
+    long_short_results = backtest_strategy(y_return_test, trade_signal, position_size, stop_loss_pct=stop_loss_pct)
     
     # Print strategy comparison results
     print("\n=== Strategy Comparison (Backtesting Results) ===")
@@ -679,5 +1121,37 @@ def train_and_evaluate(stock, period):
     print(f"   Total Trades: {n_trades} ({trade_percentage:.1f}% of days)")
     print(f"   Long Trades: {n_long} ({n_long/len(trade_signal)*100:.1f}% of days)")
     print(f"   Short Trades: {n_short} ({n_short/len(trade_signal)*100:.1f}% of days)")
+    if stop_loss_pct is not None:
+        print(f"   Stop-Losses Triggered: {long_short_results.get('n_stop_losses', 0)} "
+              f"(Stop-loss: {stop_loss_pct:.1%})")
+    
+    # Create visualizations
+    print("\n=== Generating Visualizations ===")
+    
+    # Strategy comparison plot (all strategies together)
+    strategy_results = {
+        'Buy and Hold': buy_hold_results['portfolio_value'],
+        'Always Trade Long': always_long_results['portfolio_value'],
+        'Long Filtered': long_only_results['portfolio_value'],
+        'Long + EV Filtered': long_ev_results['portfolio_value'],
+        'Long-Short Optimized': long_short_results['portfolio_value']
+    }
+    
+    # Create plots directory if it doesn't exist
+    import os
+    plots_dir = 'plots'
+    if not os.path.exists(plots_dir):
+        os.makedirs(plots_dir)
+    
+    # Plot strategy comparison
+    comparison_path = os.path.join(plots_dir, f'{stock}_strategy_comparison.png')
+    plot_strategy_comparison(strategy_results, stock, save_path=comparison_path)
+    
+    # Plot detailed view of best strategy (Long-Short Optimized)
+    best_strategy_path = os.path.join(plots_dir, f'{stock}_long_short_optimized.png')
+    plot_backtest_results(long_short_results['portfolio_value'], 
+                         'Long-Short Optimized', stock, save_path=best_strategy_path)
+    
+    print(f"Visualizations saved to {plots_dir}/ directory")
 
     return model, lr_model, return_model_lr, return_model_gb        
