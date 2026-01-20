@@ -11,7 +11,11 @@ if __name__ == "__main__":
     # - "walk_forward": Walk-forward validation (more realistic, addresses overfitting)
     validation_method = "walk_forward"  # Change to "single" for original behavior
     
-    stocks = ['AAPL', 'MSFT', 'AMZN']
+    stocks = [
+        "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA",
+        "JPM", "GS", "BAC",
+        "WMT", "DIS", "CAT"
+    ]
 
     for stock in stocks:
         print(f"\n{'='*50}")

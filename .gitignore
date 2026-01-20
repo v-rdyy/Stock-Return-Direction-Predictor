@@ -41,3 +41,6 @@ models/
 *.pkl
 *.joblib
 
+# Streamlit demo outputs (saved models and predictions)
+outputs/
+!outputs/.gitkeep

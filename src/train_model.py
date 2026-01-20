@@ -7,6 +7,8 @@ from sklearn.calibration import CalibratedClassifierCV
 
 import numpy as np
 import matplotlib.pyplot as plt
+import pickle
+import os
 
 import pandas as pd 
 
@@ -71,6 +73,71 @@ def analyze_errors(y_test, y_pred, X_test):
         print(f"\nFalse Negative Patterns (avg feature values):")
         for feature, value in fn_features.items():
             print(f"  {feature:15}: {value:8.4f}")
+
+
+def save_streamlit_artifacts(stock, calibrated_rf, scaler, ensemble_models, 
+                              X_test, y_test, y_proba_rf_cal, uncertainty, 
+                              y_return_test, df_test, output_dir='outputs'):
+    """
+    Saves artifacts needed for the Streamlit demo app.
+    
+    Args:
+        stock: Stock ticker symbol
+        calibrated_rf: Calibrated Random Forest classifier
+        scaler: StandardScaler fitted on training data
+        ensemble_models: List of ensemble Random Forest models for uncertainty estimation
+        X_test: Test feature matrix (with dates/index)
+        y_test: Test labels (binary)
+        y_proba_rf_cal: Calibrated probabilities (P(up))
+        uncertainty: Uncertainty estimates (variance across ensemble)
+        y_return_test: Test return values
+        df_test: Test dataframe (with dates/index)
+        output_dir: Directory to save artifacts (default: 'outputs')
+    """
+    # Create output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    
+    # Save calibrated model
+    model_path = os.path.join(output_dir, f'{stock}_calibrated_model.pkl')
+    with open(model_path, 'wb') as f:
+        pickle.dump(calibrated_rf, f)
+    
+    # Save scaler
+    scaler_path = os.path.join(output_dir, f'{stock}_scaler.pkl')
+    with open(scaler_path, 'wb') as f:
+        pickle.dump(scaler, f)
+    
+    # Save ensemble models (for uncertainty estimation)
+    ensemble_path = os.path.join(output_dir, f'{stock}_ensemble_models.pkl')
+    with open(ensemble_path, 'wb') as f:
+        pickle.dump(ensemble_models, f)
+    
+    # Create predictions dataframe with dates, probabilities, uncertainty, and actual returns
+    # Use test set index to preserve dates
+    predictions_df = pd.DataFrame({
+        'date': df_test.index,  # Preserve date index
+        'p_up': y_proba_rf_cal,
+        'uncertainty': uncertainty,
+        'actual_return': y_return_test.values,
+        'actual_label': y_test.values
+    })
+    
+    # Add feature values for context
+    feature_cols = ['returns', 'ma5', 'ma20', 'volatility', 'momentum', 'rsi', 'price_to_ma', 'volume_ratio']
+    for col in feature_cols:
+        if col in X_test.columns:
+            predictions_df[col] = X_test[col].values
+    
+    # Save predictions dataframe
+    predictions_path = os.path.join(output_dir, f'{stock}_predictions.csv')
+    predictions_df.to_csv(predictions_path, index=False)
+    
+    print(f"\n=== Saved Streamlit Artifacts ===")
+    print(f"Models saved to {output_dir}/")
+    print(f"  - {stock}_calibrated_model.pkl")
+    print(f"  - {stock}_scaler.pkl")
+    print(f"  - {stock}_ensemble_models.pkl")
+    print(f"  - {stock}_predictions.csv")
 
 
 def calculate_transaction_cost(volatility, base_cost=0.001, volatility_multiplier=2.0):
@@ -585,6 +652,28 @@ def walk_forward_validation(stock, period, train_size=0.7, test_size=0.1, step=0
         if 'portfolio_value' in window_result:
             all_portfolio_values.extend(window_result['portfolio_value'])
         
+        # Save artifacts from the last window (for Streamlit demo)
+        # Check if this is the last window by seeing if the next one would exceed n_total
+        if train_end + n_test + n_step > n_total:
+            # This is the last window - save artifacts
+            models_data = window_result.get('models', {})
+            if models_data:
+                # Get df_test from the full dataframe
+                df_test = df.loc[X_test_window.index]
+                save_streamlit_artifacts(
+                    stock, 
+                    models_data['calibrated_rf'],
+                    models_data['scaler'],
+                    models_data['ensemble_models'],
+                    models_data['X_test'],
+                    models_data['y_test'],
+                    models_data['y_proba_rf_cal'],
+                    models_data['uncertainty'],
+                    models_data['y_return_test'],
+                    df_test,
+                    output_dir='outputs'
+                )
+        
         # Slide forward
         train_end += n_step
         window_num += 1
@@ -650,6 +739,21 @@ def _train_and_evaluate_window(X_train, X_test, y_train, y_test, y_return_train,
     
     lr_model = LogisticRegression(random_state=42, max_iter=1000)
     lr_model.fit(X_train_scaled, y_train)
+    
+    # Train ensemble of Random Forest models (for uncertainty estimation)
+    n_models = 5
+    ensemble_models = [model]  # Include main model
+    ensemble_probas = [model.predict_proba(X_test_scaled)[:, 1]]  # Include main model predictions
+    for i in range(1, n_models):
+        rf_ensemble = RandomForestClassifier(n_estimators=100, random_state=42+i)
+        rf_ensemble.fit(X_train_scaled, y_train)
+        ensemble_models.append(rf_ensemble)
+        proba = rf_ensemble.predict_proba(X_test_scaled)[:, 1]
+        ensemble_probas.append(proba)
+    
+    # Calculate uncertainty
+    ensemble_probas = np.array(ensemble_probas)
+    uncertainty = np.var(ensemble_probas, axis=0)
     
     # Calibrate probabilities
     model_cal = CalibratedClassifierCV(model, method='isotonic', cv=5)
@@ -736,6 +840,18 @@ def _train_and_evaluate_window(X_train, X_test, y_train, y_test, y_return_train,
               f"Drawdown: {results['max_drawdown']:.2%}, Trades: {results['n_trades']} "
               f"(Long: {results['n_long']}, Short: {results['n_short']})")
     
+    # Also return models and data for artifact saving
+    results['models'] = {
+        'calibrated_rf': model_cal,
+        'scaler': scaler,
+        'ensemble_models': ensemble_models,
+        'X_test': X_test,
+        'y_test': y_test,
+        'y_proba_rf_cal': y_proba_rf_cal,
+        'uncertainty': uncertainty,
+        'y_return_test': y_return_test
+    }
+    
     return results
 
 
@@ -759,6 +875,8 @@ def train_and_evaluate(stock, period):
     X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
     # Split return target with the same split (same indices since shuffle=False)
     _, _, y_return_train, y_return_test = train_test_split(X, y_return, test_size=0.2, shuffle=False)
+    # Get test dataframe with dates/index (same indices as X_test)
+    df_test = df.loc[X_test.index]
 
     # Scale features (fit on train, transform both)
     scaler = StandardScaler()
@@ -776,10 +894,12 @@ def train_and_evaluate(stock, period):
     # Multiple models with different random seeds capture prediction variance
     # Higher variance = more uncertainty (models disagree), Lower variance = less uncertainty (models agree)
     n_models = 5
-    ensemble_probas = [y_proba_rf]  # Include main model
+    ensemble_models = [model]  # Include main model
+    ensemble_probas = [y_proba_rf]  # Include main model predictions
     for i in range(1, n_models):  # Start from 1 since we already have main model
         rf_ensemble = RandomForestClassifier(n_estimators=100, random_state=42+i)
         rf_ensemble.fit(X_train_scaled, y_train)
+        ensemble_models.append(rf_ensemble)  # Save model
         proba = rf_ensemble.predict_proba(X_test_scaled)[:, 1]
         ensemble_probas.append(proba)
 
@@ -955,6 +1075,13 @@ def train_and_evaluate(stock, period):
         print(f"Mean realized return on high-confidence days: {mean_realized_return_high_conf:.4f}")
         print(f"Linear Regression MAE (high-confidence only): {lr_mae_high_conf:.6f}")
         print(f"Gradient Boosting MAE (high-confidence only): {gb_mae_high_conf:.6f}")
+
+    # Save artifacts for Streamlit demo
+    save_streamlit_artifacts(
+        stock, calibrated_rf, scaler, ensemble_models,
+        X_test, y_test, y_proba_rf_cal, uncertainty,
+        y_return_test, df_test, output_dir='outputs'
+    )
 
     # Optimize thresholds (bias threshold and EV threshold)
     # Tests different combinations to find best Sharpe ratio (including shorting)

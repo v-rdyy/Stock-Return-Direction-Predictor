@@ -36,7 +36,7 @@ git clone <your-repo-url>
 cd firsttrading
 ```
 
-2. Create a virtual environment (recommended):
+2. Create a virtual environment:
 ```bash
 python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
@@ -56,12 +56,13 @@ python3 src/main.py
 ```
 
 This executes the full pipeline:
-1. Downloads 2 years of data for AAPL, MSFT, and AMZN
+1. Downloads 2 years of data for 12 companies: AAPL, MSFT, GOOGL, AMZN, META, NVDA, JPM, GS, BAC, WMT, DIS, and CAT
 2. Creates features and labels
 3. **Phase 1**: Trains probability models, calibrates probabilities, estimates uncertainty
 4. **Phase 2**: Trains expected return models (evaluated conditionally)
 5. **Phase 3**: Optimizes thresholds, generates trade signals, sizes positions, backtests strategies
 6. Generates visualizations (equity curves, drawdown plots) saved to `plots/` directory
+7. Saves models and predictions to `outputs/` directory (for Streamlit demo)
 
 **Note**: By default, `main.py` uses walk-forward validation. To use single split, change `validation_method = "single"` in `main.py`.
 
@@ -76,6 +77,32 @@ prob_model_rf, prob_model_lr, return_model_lr, return_model_gb = train_and_evalu
 # Walk-forward validation
 walk_forward_validation("AAPL", "2y", train_size=0.7, test_size=0.1, step=0.1, verbose=True)
 ```
+
+### Streamlit Demo App
+
+A lightweight tool for inspecting calibrated market bias probabilities and uncertainty. The app demonstrates probabilistic reasoning and uncertainty estimation—not trading signals or performance claims.
+
+**To run the demo**:
+
+1. First, generate artifacts by running the training pipeline:
+   ```bash
+   python3 src/main.py
+   ```
+   This saves models and predictions to the `outputs/` directory.
+
+2. Launch the Streamlit app:
+   ```bash
+   streamlit run streamlit_app.py
+   ```
+
+3. In the app:
+   - Select a ticker (dropdown of available trained stocks)
+   - Select a date (dropdown of available dates)
+   - View probabilistic bias estimates (P(up), uncertainty, bias regime)
+   - Inspect feature values for context
+   - See historical context plot (probability vs actual returns)
+
+The app loads pre-computed models and predictions and does not retrain models or simulate trading.
 
 ## Features
 
@@ -135,8 +162,10 @@ firsttrading/
 │   └── main.py                 # Entry point - runs pipeline on multiple stocks
 ├── notebooks/
 │   └── test_system.ipynb       # Jupyter notebook for interactive testing
+├── outputs/                    # Saved models and predictions for Streamlit demo
 ├── plots/                      # Generated visualizations (equity curves, drawdown plots)
 ├── data/                       # Directory for data files (empty - data downloaded on-demand)
+├── streamlit_app.py            # Streamlit demo app (probabilistic inspection only)
 ├── requirements.txt            # Python dependencies
 └── README.md                   # This file
 ```
@@ -173,17 +202,17 @@ firsttrading/
 
 ### What This System Does NOT Do
 
-- This system is not intended for live trading or profit guarantees
-- Does not use intraday data (daily resolution only)
-- Does not account for market impact or slippage (simplified cost model)
-- Does not optimize for production deployment (threshold optimization may overfit)
-- Does not provide real-time trading signals (historical backtesting only)
+- Intended for educational/research purposes, not live trading
+- Uses daily data only (no intraday execution)
+- Uses simplified cost model (does not account for market impact or slippage)
+- Threshold optimization may overfit (not optimized for production deployment)
+- Historical backtesting only (does not provide real-time trading signals)
 
 ## Critical Caveats and Limitations
 
 ### Threshold Optimization
 
-Threshold optimization is performed on a fixed historical window and may overfit. **Threshold optimization is used for sensitivity analysis, not as a claim of deployable alpha.** Results are used to study sensitivity and relative performance, not to claim deployable alpha. For production use, optimize on one window and evaluate on a later, untouched window (walk-forward validation).
+Threshold optimization is performed on a fixed historical window and may overfit. **Threshold optimization is used for sensitivity analysis, not as a claim of deployable alpha.** For production use, optimize on one window and evaluate on a later, untouched window (walk-forward validation).
 
 ### Position Sizing
 
@@ -191,15 +220,15 @@ We use a capped, fractional Kelly-style heuristic for risk-aware sizing, not a t
 
 ### Transaction Costs
 
-Results incorporate transaction costs as a return threshold buffer. A fixed transaction cost (0.1%) is incorporated via the EV threshold, with volatility scaling. This is a simplified model; real trading includes bid-ask spreads, market impact, slippage, and broker-specific fees.
+Transaction costs are incorporated as a return threshold buffer. A base cost of 0.1% is used with volatility scaling. This is a simplified model; real trading includes bid-ask spreads, market impact, slippage, and broker-specific fees.
 
 ### Expected Return Models (R² Interpretation)
 
-For financial return prediction, low or even negative R² values are expected due to high noise. **We don't use regression accuracy globally; we use expected return estimates conditionally after bias filtering (only on high-confidence days from Phase 1).** The regression models are not evaluated on global accuracy (which would be poor). Instead, they provide expected return estimates that are used conditionally—only after the bias filter identifies high-confidence days. The results demonstrate this conditional usefulness through selective trading performance.
+For financial return prediction, low or even negative R² values are expected due to high noise. **We use expected return estimates conditionally after bias filtering (only on high-confidence days from Phase 1), not globally.** The regression models provide expected return estimates that are used conditionally—only after the bias filter identifies high-confidence days. The results demonstrate this conditional usefulness through selective trading performance.
 
 ### Performance Metrics Interpretation
 
-**Sharpe ratios are used for relative comparison, not as claims of deployable performance.** High Sharpe ratios (e.g., 3-4) on daily data are not realistic for live trading and should not be interpreted as such. Sharpe is used here as a relative comparison metric across strategies and windows, not as a claim of deployable alpha.
+**Sharpe ratios are used for relative comparison, not as claims of deployable performance.** High Sharpe ratios (e.g., 3-4) on daily data are not realistic for live trading. Sharpe is used here as a relative comparison metric across strategies and windows.
 
 **Why Sharpe ratios may appear high:**
 - Single stock focus (no diversification drag)
@@ -208,7 +237,7 @@ For financial return prediction, low or even negative R² values are expected du
 - Daily resolution (no intraday volatility/friction)
 - No market impact modeling (assumes perfect execution)
 
-**Correct interpretation**: Compare Sharpe ratios across strategies (e.g., Strategy A vs Strategy B) or across walk-forward windows to understand relative performance, not as absolute performance guarantees.
+Compare Sharpe ratios across strategies or walk-forward windows to understand relative performance, not as absolute performance guarantees.
 
 ### Why This Matters
 
@@ -249,9 +278,10 @@ The system is designed for **educational and research purposes** to demonstrate 
 - yfinance: Stock data download
 - scikit-learn: Machine learning (models, metrics, preprocessing, calibration)
 - matplotlib: Visualization (equity curves, drawdown plots)
-- jupyter: Interactive notebook for testing (optional)
+- streamlit: Interactive demo app (probabilistic inspection tool)
+- jupyter: Interactive notebook for testing
 
-## Future Improvements (Optional)
+## Future Improvements
 
 Potential extensions:
 - Regime analysis (performance by market conditions)
